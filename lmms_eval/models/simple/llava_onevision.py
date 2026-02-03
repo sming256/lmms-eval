@@ -82,6 +82,7 @@ class Llava_OneVision(lmms):
         mm_spatial_pool_mode: Optional[str] = "bilinear",
         token_strategy: Optional[str] = "single",  # could be "single" or "multiple", "multiple" denotes adding multiple <image> tokens for each frame
         video_decode_backend: str = "decord",
+        frame_indices_json: Optional[str] = None,  # path to json file containing keyframe indices for videos (in seconds)
         **kwargs,
     ) -> None:
         super().__init__()
@@ -117,6 +118,13 @@ class Llava_OneVision(lmms):
         self.mm_spatial_pool_stride = mm_spatial_pool_stride
         self.mm_spatial_pool_mode = mm_spatial_pool_mode
         self.video_decode_backend = video_decode_backend
+
+        # (Optional) keyframe sampling
+        if frame_indices_json is not None:
+            with open(frame_indices_json, "r") as f:
+                self.frame_indices_json = json.load(f)
+        else:
+            self.frame_indices_json = None
 
         overwrite_config = {}
         overwrite_config["mm_spatial_pool_stride"] = self.mm_spatial_pool_stride
@@ -390,17 +398,42 @@ class Llava_OneVision(lmms):
                     new_list.append(j)
         return new_list
 
-    def load_video(self, video_path, max_frames_num):
+    def load_video(self, video_path, max_frames_num, context):
         if type(video_path) == str:
             vr = VideoReader(video_path, ctx=cpu(0))
+            video_name = video_path.split("/")[-1].split(".")[0]
         else:
             vr = VideoReader(video_path[0], ctx=cpu(0))
+            video_name = video_path[0].split("/")[-1].split(".")[0]
         total_frame_num = len(vr)
-        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
-        frame_idx = uniform_sampled_frames.tolist()
+        video_fps = vr.get_avg_fps()
+
+        if self.frame_indices_json is None:
+            uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
+            frame_idx = uniform_sampled_frames.tolist()
+        else:
+            frame_idx = self.sample_frames(
+                context,
+                self.frame_indices_json[video_name],
+                max_frames_num,
+                video_fps,
+                total_frame_num,
+            )
         spare_frames = vr.get_batch(frame_idx).asnumpy()
         return spare_frames  # (frames, height, width, channels)
 
+    def sample_frames(self, context, frame_indices_json, max_frames_num, video_fps, total_frame_num):
+        # one video may have multiple questions, we need to find the corresponding question based on context
+        for idx, data in enumerate(frame_indices_json):
+            if data["question"] in context:
+                frames = np.array(frame_indices_json[idx]["frames"])
+        assert len(frames) == max_frames_num, f"Number of sampled frames {len(frames)} does not match max_frames_num {max_frames_num}"
+        sampled_frames_idx = frames * video_fps  # convert seconds to frame indices
+        sampled_frames_idx = np.round(sampled_frames_idx).astype(int)  # round to the nearest integer
+        sampled_frames_idx = np.sort(sampled_frames_idx)  # sort the frames
+        sampled_frames_idx = np.clip(sampled_frames_idx, 0, total_frame_num - 1).tolist()
+        return sampled_frames_idx
+    
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -491,7 +524,7 @@ class Llava_OneVision(lmms):
                         image_tensor = []
                         try:
                             if self.video_decode_backend == "decord":
-                                frames = self.load_video(visual, self.max_frames_num)
+                                frames = self.load_video(visual, self.max_frames_num, context)
                             elif self.video_decode_backend == "pyav":
                                 frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
                             frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].half().to(self._device)
