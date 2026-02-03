@@ -71,8 +71,20 @@ class Qwen3_VL(Qwen3_VLSimple):
             if self.nframes is not None:
                 video_kwargs["nframes"] = self.nframes
                 video_kwargs.pop("fps")
-
-            batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
+            
+            # (Optional) keyframe sampling
+            if self.frame_indices_json is not None:
+                batched_messages = []
+                for context, chat_message, vid in zip(ctx, chat_messages, videos):
+                    tmp_video_kwargs = video_kwargs.copy()
+                    video_name = vid.split("/")[-1].split(".")[0]
+                    for idx, data in enumerate(self.frame_indices_json[video_name]):
+                        if data["question"] in context:
+                            frame_indices = self.frame_indices_json[video_name][idx]["frames"]
+                            tmp_video_kwargs["frame_indices"] = frame_indices
+                    batched_messages.append(chat_message.to_hf_messages(video_kwargs=tmp_video_kwargs))
+            else:
+                batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
             texts = self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs, video_kwargs_qwen = process_vision_info(
                 batched_messages,

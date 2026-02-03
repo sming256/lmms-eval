@@ -4,6 +4,7 @@ from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
 import decord
+import json
 import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
@@ -59,6 +60,7 @@ class Qwen2_5_VL(lmms):
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
         reasoning_prompt: Optional[str] = None,
+        frame_indices_json: Optional[str] = None,  # path to json file containing keyframe indices for videos (in seconds)
         **kwargs,
     ) -> None:
         super().__init__()
@@ -121,6 +123,14 @@ class Qwen2_5_VL(lmms):
             f"nframes: {self.nframes}, "
             f"fps: {self.fps}"
         )
+
+        # (Optional) keyframe sampling
+        if frame_indices_json is not None:
+            with open(frame_indices_json, "r") as f:
+                self.frame_indices_json = json.load(f)
+            eval_logger.info(f"frame_indices_json: {frame_indices_json}")
+        else:
+            self.frame_indices_json = None
 
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
@@ -276,6 +286,15 @@ class Qwen2_5_VL(lmms):
                             if self.nframes is not None:
                                 visual_dict["nframes"] = self.nframes
                                 visual_dict.pop("fps")
+
+                            # (Optional) keyframe sampling
+                            if self.frame_indices_json is not None:
+                                video_name = visual.split("/")[-1].split(".")[0]
+                                for idx, data in enumerate(self.frame_indices_json[video_name]):
+                                    if data["question"] in context:
+                                        frame_indices = self.frame_indices_json[video_name][idx]["frames"]
+                                        visual_dict["frame_indices"] = frame_indices
+
                             processed_visuals.append(visual_dict)
                         elif isinstance(visual, Image.Image):  # Handle both single and multiple images
                             base64_image = visual.convert("RGB")
@@ -493,6 +512,15 @@ class Qwen2_5_VL(lmms):
                                 if self.nframes is not None:
                                     visual_dict["nframes"] = self.nframes
                                     visual_dict.pop("fps")
+
+                                # (Optional) keyframe sampling
+                                if self.frame_indices_json is not None:
+                                    video_name = visual.split("/")[-1].split(".")[0]
+                                    for idx, data in enumerate(self.frame_indices_json[video_name]):
+                                        if data["question"] in context:
+                                            frame_indices = self.frame_indices_json[video_name][idx]["frames"]
+                                            visual_dict["frame_indices"] = frame_indices
+                                
                                 processed_visuals.append(visual_dict)
                             elif isinstance(visual, Image.Image):
                                 base64_image = visual.convert("RGB")
