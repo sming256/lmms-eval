@@ -61,15 +61,17 @@ class Qwen3_VL(Qwen3_VLSimple):
 
             # Apply chat template
             video_kwargs = {
-                "max_pixels": self.max_pixels,
-                "min_pixels": self.min_pixels,
+                "max_pixels": self.video_max_pixels,
+                "min_pixels": self.video_min_pixels,
+                "total_pixels": self.video_total_pixels,
+                "min_frames": self.min_frames,
+                "max_frames": self.max_frames,
+                "fps": self.fps,
             }
-            if self.fps is not None:
-                video_kwargs["fps"] = self.fps
-                # limit the number of frames in case fps is set
-                video_kwargs["max_frames"] = self.max_num_frames
-            else:
-                video_kwargs["nframes"] = self.max_num_frames
+            if self.nframes is not None:
+                video_kwargs["nframes"] = self.nframes
+                video_kwargs.pop("fps")
+
             batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
             texts = self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs, video_kwargs_qwen = process_vision_info(
@@ -88,28 +90,18 @@ class Qwen3_VL(Qwen3_VLSimple):
                     list(video_metadatas),
                 )
 
-            if self.batch_size > 1:
-                inputs = self.processor(
-                    text=texts,
-                    images=image_inputs,
-                    videos=video_inputs,
-                    video_metadata=video_metadatas,
-                    **video_kwargs,
-                    do_resize=False,
-                    padding=True,
-                    padding_side="left",
-                    return_tensors="pt",
-                )
-            else:
-                inputs = self.processor(
-                    text=texts,
-                    images=image_inputs,
-                    videos=video_inputs,
-                    video_metadata=video_metadatas,
-                    **video_kwargs,
-                    do_resize=False,
-                    return_tensors="pt",
-                )
+            padding_side = "left" if self.batch_size > 1 else "right"
+            inputs = self.processor(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                video_metadata=video_metadatas,
+                do_resize=False,
+                padding=True,
+                padding_side=padding_side,
+                return_tensors="pt",
+                **video_kwargs,
+            )
 
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")

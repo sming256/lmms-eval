@@ -66,34 +66,20 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
 
             # Apply chat template
             video_kwargs = {
-                "max_pixels": self.max_pixels,
-                "min_pixels": self.min_pixels,
+                "max_pixels": self.video_max_pixels,
+                "min_pixels": self.video_min_pixels,
+                "total_pixels": self.video_total_pixels,
+                "min_frames": self.min_frames,
+                "max_frames": self.max_frames,
+                "fps": self.fps,
             }
-            if self.fps is not None:
-                video_kwargs["fps"] = self.fps
-            else:
-                # Probe videos to get frame count and set nframes = min(max_num_frames, total_frames)
-                # This avoids the error when video has fewer frames than max_num_frames
-                if videos and decord is not None:
-                    try:
-                        video_path = videos[0]  # Assume batch size 1 for videos
-                        vr = decord.VideoReader(video_path)
-                        video_total_frames = len(vr)
-                        nframes = min(self.max_num_frames, video_total_frames)
-                        # qwen_vl_utils requires nframes to be a multiple of 2 (FRAME_FACTOR)
-                        # and rounds using round_by_factor, so we need to floor to even number
-                        # to avoid rounding up past total_frames
-                        nframes = (nframes // 2) * 2  # Floor to nearest even number
-                        nframes = max(2, nframes)  # At least 2 frames
-                        video_kwargs["nframes"] = nframes
-                    except Exception as e:
-                        eval_logger.warning(f"Failed to probe video {videos[0]}: {e}, using default nframes")
-                        video_kwargs["nframes"] = self.max_num_frames
-                else:
-                    video_kwargs["nframes"] = self.max_num_frames
+            if self.nframes is not None:
+                video_kwargs["nframes"] = self.nframes
+                video_kwargs.pop("fps")
+
             batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
             texts = self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(batched_messages)
+            image_inputs, video_inputs, video_kwargs = process_vision_info(batched_messages, return_video_kwargs=True)
             padding_side = "left" if self.batch_size > 1 else "right"
             inputs = self.processor(
                 text=texts,
@@ -102,6 +88,7 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
                 padding=True,
                 padding_side=padding_side,
                 return_tensors="pt",
+                **video_kwargs,
             )
 
             if self.device_map == "auto":

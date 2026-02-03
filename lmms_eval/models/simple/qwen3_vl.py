@@ -44,11 +44,16 @@ class Qwen3_VL(lmms):
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
         attn_implementation: Optional[str] = None,
-        min_pixels: int = 256 * 28 * 28,
-        max_pixels: int = 1605632,
-        max_num_frames: int = 32,
+        min_pixels: int = 128 * 32 * 32,
+        max_pixels: int = 16384 * 32 * 32,
+        video_min_pixels: Optional[int] = 4 * 32 * 32,
+        video_max_pixels: Optional[int] = 768 * 32 * 32,
+        video_total_pixels: Optional[int] = 16384 * 32 * 32,
+        min_frames: Optional[int] = 4,
+        max_frames: Optional[int] = 256,
+        nframes: Optional[int] = None,
+        fps: Optional[float] = 2.0,
         use_custom_video_loader: Optional[bool] = False,
-        fps: Optional[float] = None,  # Only applicable if use_custom_video_loader is True
         max_image_size: Optional[int] = None,  # Only applicable if use_custom_video_loader is True
         system_prompt: Optional[str] = "You are a helpful assistant.",
         interleave_visuals: Optional[bool] = False,
@@ -95,9 +100,29 @@ class Qwen3_VL(lmms):
         match = re.search(r"A\d+B", pretrained)
         model_fn = Qwen3VLMoeForConditionalGeneration if match else Qwen3VLForConditionalGeneration
         self._model = model_fn.from_pretrained(pretrained, **model_kwargs).eval()
+
+        # data configuration for fetch_image
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
-        self.max_num_frames = max_num_frames
+        eval_logger.info(f"max_pixels: {self.max_pixels}, min_pixels: {self.min_pixels}")
+
+        # data configuration for fetch_video
+        self.video_min_pixels = video_min_pixels
+        self.video_max_pixels = video_max_pixels
+        self.video_total_pixels = video_total_pixels
+        self.min_frames = min_frames
+        self.max_frames = max_frames
+        self.nframes = nframes
+        self.fps = fps
+        eval_logger.info(
+            f"video_min_pixels: {self.video_min_pixels}, "
+            f"video_max_pixels: {self.video_max_pixels}, "
+            f"video_total_pixels: {self.video_total_pixels}, "
+            f"min_frames: {self.min_frames}, "
+            f"max_frames: {self.max_frames}, "
+            f"nframes: {self.nframes}, "
+            f"fps: {self.fps}"
+        )
 
         if reasoning_prompt:
             self.reasoning_prompt = reasoning_prompt.replace("\\n", "\n")
@@ -240,18 +265,20 @@ class Qwen3_VL(lmms):
                 if visual_list[i] is not None:
                     for visual in visual_list[i]:
                         if isinstance(visual, str) and visual.endswith((".mp4", ".avi", ".mov")):  # Video file
-                            vr = decord.VideoReader(visual)
-                            first_frame = vr[0].asnumpy()
-                            height, width = first_frame.shape[:2]
-                            # max_pixels = height * width
-                            processed_visuals.append(
-                                {
-                                    "type": "video",
-                                    "video": visual,
-                                    "max_pixels": self.max_pixels,
-                                    "min_pixels": self.min_pixels,
-                                }
-                            )
+                            visual_dict = {
+                                "type": "video",
+                                "video": visual,
+                                "min_pixels": self.video_min_pixels,
+                                "max_pixels": self.video_max_pixels,
+                                "total_pixels": self.video_total_pixels,
+                                "min_frames": self.min_frames,
+                                "max_frames": self.max_frames,
+                                "fps": self.fps,
+                            }
+                            if self.nframes is not None:
+                                visual_dict["nframes"] = self.nframes
+                                visual_dict.pop("fps")
+                            processed_visuals.append(visual_dict)
                         elif isinstance(visual, Image.Image):  # Handle both single and multiple images
                             processed_visuals.append(
                                 {
@@ -292,42 +319,36 @@ class Qwen3_VL(lmms):
                     )
 
                 batched_messages.append(message)
+
             texts = self.processor.apply_chat_template(batched_messages, tokenize=False, add_generation_prompt=True)
-            # TODO: refactor code to allow return_video_kwargs and return_video_metadata
-            image_inputs, video_inputs = process_vision_info(
+            image_inputs, video_inputs, video_kwargs = process_vision_info(
                 batched_messages,
-                return_video_kwargs=False,
                 image_patch_size=16,
-                return_video_metadata=False,
+                return_video_kwargs=True,
+                return_video_metadata=True,
             )
+
             if video_inputs is not None:
-                total_frames = video_inputs[0].shape[0]
-                indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
-                # Ensure unique indices if linspace produces duplicates for few frames
-                indices = np.unique(indices)
-                # Append the last frame index if not already included
-                if total_frames - 1 not in indices:
-                    indices = np.append(indices, total_frames - 1)
-                    indices = np.unique(indices)  # Ensure uniqueness again
-                video_inputs[0] = video_inputs[0][indices]
-            if self.batch_size > 1:
-                inputs = self.processor(
-                    text=texts,
-                    images=image_inputs,
-                    videos=video_inputs,
-                    do_resize=False,
-                    padding=True,
-                    padding_side="left",
-                    return_tensors="pt",
+                video_inputs, video_metadatas = zip(*video_inputs)
+                video_inputs, video_metadatas = (
+                    list(video_inputs),
+                    list(video_metadatas),
                 )
             else:
-                inputs = self.processor(
-                    text=texts,
-                    images=image_inputs,
-                    videos=video_inputs,
-                    do_resize=False,
-                    return_tensors="pt",
-                )
+                video_metadatas = None
+
+            padding_side = "left" if self.batch_size > 1 else "right"
+            inputs = self.processor(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                video_metadata=video_metadatas,
+                do_resize=False,
+                padding=True,
+                padding_side=padding_side,
+                return_tensors="pt",
+                **video_kwargs,
+            )
             if self.device_map == "auto":
                 inputs = inputs.to("cuda")
             else:
@@ -335,7 +356,7 @@ class Qwen3_VL(lmms):
 
             # Set default generation kwargs
             default_gen_kwargs = {
-                "max_new_tokens": 128,
+                "max_new_tokens": 32768,
                 "temperature": 0.0,  # Set to 0 for greedy default
                 "top_p": None,
                 "num_beams": 1,
